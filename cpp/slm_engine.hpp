@@ -499,7 +499,7 @@ struct ModelConfig {
 
 struct GenConfig {
     int   max_tokens = 128;
-    float temp       = 0.8f;
+    float temp       = 0.7f;
     float top_p      = 0.9f;
 };
 
@@ -1309,8 +1309,9 @@ public:
         for (int step = 0; step < gc_.max_tokens && pos < model_.config().max_seq_len; step++) {
             int next = sample_top_p(logits.data(), static_cast<int>(logits.size()),
                                     gc_.temp, gc_.top_p, rng_);
-            if (next == tok.eos()) break;
+            if (next == tok.eos() || next == 0) break;
             std::string piece = tok.decode(next);
+            if (piece == "<|endoftext|>" || piece == "</s>" || piece == "<eos>") break;
             callback(next, piece);
 
             // Feed the sampled token back through the one-token cached path.

@@ -28,7 +28,7 @@ struct Args {
     std::string model   = "model.slm";
     std::string prompt  = "";
     int         n       = 128;
-    float       temp    = 0.8f;
+    float       temp    = 0.7f;
     float       top_p   = 0.9f;
     bool        valid   = true;
 };
@@ -44,12 +44,12 @@ static void usage() {
         "  info    Print model metadata\n"
         "\n"
         "Options:\n"
-        "  -m <path>   Path to .slm model file   (default: model.slm)\n"
-        "  -n <int>    Number of tokens to generate (bench/run/chat, default: 128)\n"
-        "  -p <text>   Prompt string              (run mode)\n"
-        "  -t <float>  Sampling temperature        (default: 0.8)\n"
-        "  --top-p <f> Top-p nucleus sampling      (default: 0.9)\n"
-        "  -h          Show this help\n"
+        "  -m <path>       Path to .slm model file   (default: model.slm)\n"
+        "  -n <int>        Number of tokens to generate (bench/run/chat, default: 128)\n"
+        "  -p <text>       Prompt string              (run mode)\n"
+        "  -t, --temp <f>  Sampling temperature        (default: 0.7)\n"
+        "  --top-p <f>     Top-p nucleus sampling      (default: 0.9)\n"
+        "  -h              Show this help\n"
     );
 }
 
@@ -64,8 +64,8 @@ static Args parse_args(int argc, char** argv) {
         if (a == "-m" && i + 1 < argc)  { args.model  = argv[++i]; }
         else if (a == "-n" && i + 1 < argc) { args.n     = std::atoi(argv[++i]); }
         else if (a == "-p" && i + 1 < argc) { args.prompt = argv[++i]; }
-        else if (a == "-t" && i + 1 < argc) { args.temp   = std::atof(argv[++i]); }
-        else if (a == "--top-p" && i + 1 < argc) { args.top_p = std::atof(argv[++i]); }
+        else if ((a == "-t" || a == "--temp") && i + 1 < argc) { args.temp   = std::atof(argv[++i]); }
+        else if ((a == "--top-p" || a == "-top-p") && i + 1 < argc) { args.top_p = std::atof(argv[++i]); }
         else if (a == "-h" || a == "--help") { usage(); exit(0); }
         else {
             fprintf(stderr, "[SLM ERROR] Unknown option: %s\n", a.c_str());
@@ -385,11 +385,14 @@ static void cmd_chat(const Args& args) {
             int next_token = slm::sample_top_p(logits.data(), static_cast<int>(logits.size()),
                                                gc.temp, gc.top_p, rng);
 
-            if (next_token == eos_id || (has_chatml && next_token == im_end_id)) {
+            if (next_token == eos_id || next_token == 0 || (has_chatml && next_token == im_end_id)) {
                 break;
             }
 
             std::string piece = tok.decode(next_token);
+            if (piece == "<|endoftext|>" || piece == "</s>" || piece == "<eos>") {
+                break;
+            }
 
             if (!has_chatml) {
                 generated_text += piece;
