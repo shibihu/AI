@@ -106,16 +106,18 @@ def write_slm(path: str, config: dict, tensor_meta: list, tensors: dict,
 
     json_bytes = json.dumps(header, indent=2).encode("utf-8")
 
-    # The tensor_data_offset is the byte position AFTER json_bytes + 1 (for \0)
-    actual_tensor_data_offset = len(json_bytes) + 1
+    # Pad JSON header so tensor payload starts on a 4-byte boundary
+    header["tensor_data_offset"] = 0
+    for _ in range(16):
+        raw_header = json.dumps(header, indent=2).encode("utf-8")
+        padding = (4 - ((len(raw_header) + 1) % 4)) % 4
+        json_bytes = raw_header + (b" " * padding)
+        offset = len(json_bytes) + 1
+        if header["tensor_data_offset"] == offset:
+            break
+        header["tensor_data_offset"] = offset
 
-    # Update tensor_data_offset in the header and re-serialize
-    header["tensor_data_offset"] = actual_tensor_data_offset
-    json_bytes = json.dumps(header, indent=2).encode("utf-8")
-    # After re-serialisation the length may change; recalculate
-    actual_tensor_data_offset = len(json_bytes) + 1
-    header["tensor_data_offset"] = actual_tensor_data_offset
-    json_bytes = json.dumps(header, indent=2).encode("utf-8")
+    actual_tensor_data_offset = header["tensor_data_offset"]
 
     total_size = len(json_bytes) + 1  # +1 for \0 separator
     for meta in tensor_meta:

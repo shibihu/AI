@@ -4,6 +4,7 @@
 // Usage:
 //   ./slm bench  -m model.slm -n 128        Benchmark N-token generation
 //   ./slm run    -m model.slm -p "Hello"     Interactive generation
+//   ./slm chat   -m model.slm                Interactive REPL chat mode
 //   ./slm info   -m model.slm                Print model metadata
 // ============================================================================
 
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -38,11 +40,12 @@ static void usage() {
         "Modes:\n"
         "  bench   Benchmark autoregressive generation\n"
         "  run     Generate text from a prompt\n"
+        "  chat    Interactive REPL chat mode\n"
         "  info    Print model metadata\n"
         "\n"
         "Options:\n"
         "  -m <path>   Path to .slm model file   (default: model.slm)\n"
-        "  -n <int>    Number of tokens to generate (bench, default: 128)\n"
+        "  -n <int>    Number of tokens to generate (bench/run/chat, default: 128)\n"
         "  -p <text>   Prompt string              (run mode)\n"
         "  -t <float>  Sampling temperature        (default: 0.8)\n"
         "  --top-p <f> Top-p nucleus sampling      (default: 0.9)\n"
@@ -123,6 +126,49 @@ static std::string sanitize_token(const std::string& token) {
     return result;
 }
 
+static std::vector<int> encode_text(const slm::Tokenizer& tok, int vocab_size,
+                                    const std::string& text, bool include_bos = false) {
+    std::vector<int> tokens;
+    if (include_bos) {
+        int bos_id = tok.bos();
+        if (!tok.valid_id(bos_id) || bos_id >= vocab_size)
+            bos_id = tok.unk();
+        if (tok.valid_id(bos_id) && bos_id < vocab_size)
+            tokens.push_back(bos_id);
+    }
+
+    std::string word;
+    bool leading_space = false;
+    bool leading_newline = false;
+    auto append_word = [&]() {
+        if (word.empty()) return;
+        int id = tok.encode_word(word, leading_space, leading_newline);
+        if (id < 0 || id >= vocab_size)
+            id = tok.unk();
+        if (tok.valid_id(id) && id < vocab_size) {
+            tokens.push_back(id);
+        }
+        word.clear();
+        leading_space = false;
+        leading_newline = false;
+    };
+
+    for (char c : text) {
+        if (c == '\n' || c == '\r') {
+            append_word();
+            leading_newline = true;
+            leading_space = false;
+        } else if (c == ' ' || c == '\t') {
+            append_word();
+            if (!leading_newline) leading_space = true;
+        } else {
+            word.push_back(c);
+        }
+    }
+    append_word();
+    return tokens;
+}
+
 // ---------------------------------------------------------------------------
 // Mode: info
 // ---------------------------------------------------------------------------
@@ -176,6 +222,8 @@ static void cmd_bench(const Args& args) {
     int tokens_generated = 0;
 
     gen.generate("The", [&](int id, const std::string& piece) {
+        (void)id;
+        (void)piece;
         tokens_generated++;
     });
 
@@ -220,6 +268,7 @@ static void cmd_run(const Args& args) {
     int count = 0;
 
     gen.generate(prompt, [&](int id, const std::string& piece) {
+        (void)id;
         std::cout << sanitize_token(piece) << std::flush;
         count++;
     });
@@ -234,6 +283,133 @@ static void cmd_run(const Args& args) {
 }
 
 // ---------------------------------------------------------------------------
+// Mode: chat
+// ---------------------------------------------------------------------------
+
+static void cmd_chat(const Args& args) {
+    slm::Model model;
+    if (!model.load(args.model.c_str())) {
+        fprintf(stderr, "[SLM ERROR] Failed to load model\n");
+        exit(1);
+    }
+
+    const auto& config = model.config();
+    const auto& tok = model.tokenizer();
+
+    slm::KVCache cache;
+    cache.initialize(config);
+
+    slm::GenConfig gc;
+    gc.max_tokens = args.n;
+    gc.temp       = args.temp;
+    gc.top_p      = args.top_p;
+
+    std::mt19937 rng(1337);
+    int pos = 0;
+    bool first_turn = true;
+
+    bool has_chatml = (tok.lookup("<|im_start|>") >= 0 && tok.lookup("<|im_end|>") >= 0);
+    int im_end_id = tok.lookup("<|im_end|>");
+    int eos_id = tok.eos();
+
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    printf("============================================================\n");
+    printf(" SLM Chat REPL — Interactive Conversation Mode\n");
+    printf(" Model: %s\n", args.model.c_str());
+    printf(" Type 'exit' or 'quit' to end the session.\n");
+    printf("============================================================\n\n");
+
+    std::string user_input;
+    while (true) {
+        printf("User: ");
+        fflush(stdout);
+
+        if (!std::getline(std::cin, user_input)) {
+            printf("\nExiting chat.\n");
+            break;
+        }
+
+        if (user_input == "exit" || user_input == "quit" ||
+            user_input == "Exit" || user_input == "Quit") {
+            printf("Exiting chat.\n");
+            break;
+        }
+
+        if (user_input.empty()) {
+            continue;
+        }
+
+        std::string turn_prompt;
+        if (has_chatml) {
+            turn_prompt = "<|im_start|>user\n" + user_input + "<|im_end|>\n<|im_start|>assistant\n";
+        } else {
+            if (first_turn) {
+                turn_prompt = "User: " + user_input + "\nAssistant: ";
+            } else {
+                turn_prompt = "\nUser: " + user_input + "\nAssistant: ";
+            }
+        }
+
+        std::vector<int> turn_tokens = encode_text(tok, config.vocab_size, turn_prompt, first_turn);
+
+        // Ensure context length does not exceed max_seq_len (2048 tokens).
+        if (pos + static_cast<int>(turn_tokens.size()) + gc.max_tokens >= config.max_seq_len) {
+            printf("\n[SLM] Maximum context length (%d tokens) reached. Resetting conversation...\n\n",
+                   config.max_seq_len);
+            cache.initialize(config);
+            pos = 0;
+            first_turn = true;
+            if (has_chatml) {
+                turn_prompt = "<|im_start|>user\n" + user_input + "<|im_end|>\n<|im_start|>assistant\n";
+            } else {
+                turn_prompt = "User: " + user_input + "\nAssistant: ";
+            }
+            turn_tokens = encode_text(tok, config.vocab_size, turn_prompt, true);
+        }
+
+        first_turn = false;
+
+        std::vector<float> logits;
+        for (int token : turn_tokens) {
+            logits = model.forward_cached(token, pos++, cache);
+        }
+
+        printf("Assistant: ");
+        fflush(stdout);
+
+        int generated_count = 0;
+        std::string generated_text;
+
+        while (generated_count < gc.max_tokens && pos < config.max_seq_len) {
+            int next_token = slm::sample_top_p(logits.data(), static_cast<int>(logits.size()),
+                                               gc.temp, gc.top_p, rng);
+
+            if (next_token == eos_id || (has_chatml && next_token == im_end_id)) {
+                break;
+            }
+
+            std::string piece = tok.decode(next_token);
+
+            if (!has_chatml) {
+                generated_text += piece;
+                if (generated_text.find("User:") != std::string::npos ||
+                    generated_text.find("\nUser:") != std::string::npos) {
+                    break;
+                }
+            }
+
+            std::cout << sanitize_token(piece) << std::flush;
+            generated_count++;
+
+            logits = model.forward_cached(next_token, pos++, cache);
+        }
+
+        printf("\n\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -241,9 +417,10 @@ int main(int argc, char** argv) {
     Args args = parse_args(argc, argv);
     if (!args.valid) { usage(); return 1; }
 
-    if      (args.mode == "info") cmd_info(args);
+    if      (args.mode == "info")  cmd_info(args);
     else if (args.mode == "bench") cmd_bench(args);
     else if (args.mode == "run")   cmd_run(args);
+    else if (args.mode == "chat")  cmd_chat(args);
     else {
         fprintf(stderr, "[SLM ERROR] Unknown mode '%s'\n", args.mode.c_str());
         usage();
