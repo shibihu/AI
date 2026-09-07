@@ -1,0 +1,12 @@
+# Build output
+build/
+*.o
+*.out
+
+# Model weights & binary files
+*.safetensors
+*.slm
+
+# Python cache
+__pycache__/
+*.pyc
