@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,57 @@ static Args parse_args(int argc, char** argv) {
         }
     }
     return args;
+}
+
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static std::string sanitize_token(const std::string& token) {
+    std::string decoded;
+    decoded.reserve(token.size());
+
+    for (size_t i = 0; i < token.size();) {
+        // Some vocabularies store raw bytes as tokens such as <0xE2>.
+        if (i + 5 < token.size() && token[i] == '<' && token[i + 1] == '0' &&
+            (token[i + 2] == 'x' || token[i + 2] == 'X') &&
+            token[i + 5] == '>') {
+            int high = hex_value(token[i + 3]);
+            int low = hex_value(token[i + 4]);
+            if (high >= 0 && low >= 0) {
+                decoded.push_back(static_cast<char>((high << 4) | low));
+                i += 6;
+                continue;
+            }
+        }
+
+        decoded.push_back(token[i]);
+        ++i;
+    }
+
+    // GPT-2 byte-level BPE markers: U+0120 (space) and U+010A (newline).
+    std::string result;
+    result.reserve(decoded.size());
+    for (size_t i = 0; i < decoded.size();) {
+        if (i + 1 < decoded.size() &&
+            static_cast<unsigned char>(decoded[i]) == 0xC4 &&
+            static_cast<unsigned char>(decoded[i + 1]) == 0xA0) {
+            result.push_back(' ');
+            i += 2;
+        } else if (i + 1 < decoded.size() &&
+                   static_cast<unsigned char>(decoded[i]) == 0xC4 &&
+                   static_cast<unsigned char>(decoded[i + 1]) == 0x8A) {
+            result.push_back('\n');
+            i += 2;
+        } else {
+            result.push_back(decoded[i]);
+            ++i;
+        }
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +212,7 @@ static void cmd_run(const Args& args) {
     slm::Generator gen(model, gc, /*seed=*/1337);
 
     std::string prompt = args.prompt.empty() ? "Hello" : args.prompt;
+    setvbuf(stdout, nullptr, _IONBF, 0);
     fprintf(stderr, "\n[Prompt] %s\n[Output] ", prompt.c_str());
     fflush(stderr);
 
@@ -167,15 +220,14 @@ static void cmd_run(const Args& args) {
     int count = 0;
 
     gen.generate(prompt, [&](int id, const std::string& piece) {
-        fprintf(stdout, "%s", piece.c_str());
-        fflush(stdout);
+        std::cout << sanitize_token(piece) << std::flush;
         count++;
     });
 
     auto t1 = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
-    fprintf(stdout, "\n\n");
+    std::cout << "\n\n" << std::flush;
     fprintf(stderr, "\n[SLM] %d tokens in %.3fs (%.1f tok/s)\n",
             count, elapsed,
             (elapsed > 0.0) ? count / elapsed : 0.0);

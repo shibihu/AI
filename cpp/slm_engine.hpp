@@ -1,7 +1,7 @@
 #pragma once
 // ============================================================================
 // slm_engine.hpp — Lightweight C++17 Inference Engine for Small Language Models
-// Single-file / header-only. Zero external dependencies beyond POSIX + STL.
+// Single-file / header-only. Zero external dependencies beyond OS APIs + STL.
 // ============================================================================
 
 #include <algorithm>
@@ -23,10 +23,28 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#ifdef _OPENMP
+#define SLM_OMP_PRAGMA(value) _Pragma(#value)
+#define SLM_OMP_PARALLEL_FOR _Pragma("omp parallel for")
+#define SLM_OMP_PARALLEL_FOR_COLLAPSE_2 _Pragma("omp parallel for collapse(2)")
+#define SLM_OMP_SIMD _Pragma("omp simd")
+#define SLM_OMP_SIMD_REDUCE(variable) SLM_OMP_PRAGMA(omp simd reduction(+:variable))
+#else
+#define SLM_OMP_PRAGMA(value)
+#define SLM_OMP_PARALLEL_FOR
+#define SLM_OMP_PARALLEL_FOR_COLLAPSE_2
+#define SLM_OMP_SIMD
+#define SLM_OMP_SIMD_REDUCE(variable)
+#endif
 
 namespace slm {
 
@@ -61,7 +79,7 @@ inline void log_info(const char* fmt, ...) {
 }
 
 // ============================================================================
-// MappedFile — Safe POSIX mmap wrapper for read-only file access
+// MappedFile — Cross-platform read-only file mapping wrapper
 // ============================================================================
 
 class MappedFile {
@@ -73,13 +91,73 @@ public:
     MappedFile& operator=(const MappedFile&) = delete;
 
     MappedFile(MappedFile&& o) noexcept
-        : data_(o.data_), size_(o.size_), fd_(o.fd_) {
+        : data_(o.data_), size_(o.size_)
+#if defined(_WIN32) || defined(_WIN64)
+        , file_(o.file_), mapping_(o.mapping_)
+#else
+        , fd_(o.fd_)
+#endif
+    {
         o.data_ = nullptr;
         o.size_ = 0;
+#if defined(_WIN32) || defined(_WIN64)
+        o.file_ = INVALID_HANDLE_VALUE;
+        o.mapping_ = nullptr;
+#else
         o.fd_ = -1;
+#endif
     }
 
     bool open(const char* path) {
+#if defined(_WIN32) || defined(_WIN64)
+        file_ = ::CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) {
+            fprintf(stderr, "[SLM ERROR] Cannot open '%s' (Windows error %lu)\n",
+                    path, static_cast<unsigned long>(::GetLastError()));
+            return false;
+        }
+
+        LARGE_INTEGER file_size{};
+        if (!::GetFileSizeEx(file_, &file_size) || file_size.QuadPart <= 0) {
+            fprintf(stderr, "[SLM ERROR] Cannot determine size of '%s'\n", path);
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        size_ = static_cast<size_t>(file_size.QuadPart);
+        if (static_cast<LONGLONG>(size_) != file_size.QuadPart) {
+            fprintf(stderr, "[SLM ERROR] File '%s' is too large for this process\n", path);
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            size_ = 0;
+            return false;
+        }
+
+        mapping_ = ::CreateFileMappingA(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping_) {
+            fprintf(stderr, "[SLM ERROR] CreateFileMapping failed for '%s' (Windows error %lu)\n",
+                    path, static_cast<unsigned long>(::GetLastError()));
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            size_ = 0;
+            return false;
+        }
+
+        void* p = ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+        if (!p) {
+            fprintf(stderr, "[SLM ERROR] MapViewOfFile failed for '%s' (Windows error %lu)\n",
+                    path, static_cast<unsigned long>(::GetLastError()));
+            ::CloseHandle(mapping_);
+            ::CloseHandle(file_);
+            mapping_ = nullptr;
+            file_ = INVALID_HANDLE_VALUE;
+            size_ = 0;
+            return false;
+        }
+        data_ = static_cast<const uint8_t*>(p);
+        return true;
+#else
         fd_ = ::open(path, O_RDONLY);
         if (fd_ < 0) {
             fprintf(stderr, "[SLM ERROR] Cannot open '%s': %s\n", path, strerror(errno));
@@ -108,16 +186,28 @@ public:
         }
         data_ = static_cast<const uint8_t*>(p);
         return true;
+#endif
     }
 
     void close() {
+#if defined(_WIN32) || defined(_WIN64)
+        if (data_) ::UnmapViewOfFile(data_);
+        if (mapping_) ::CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE) ::CloseHandle(file_);
+#else
         if (data_ && data_ != MAP_FAILED) {
             ::munmap(const_cast<uint8_t*>(data_), size_);
         }
         if (fd_ >= 0) ::close(fd_);
+#endif
         data_ = nullptr;
         size_ = 0;
+#if defined(_WIN32) || defined(_WIN64)
+        mapping_ = nullptr;
+        file_ = INVALID_HANDLE_VALUE;
+#else
         fd_ = -1;
+#endif
     }
 
     const uint8_t* data()                const { return data_; }
@@ -135,7 +225,12 @@ public:
 private:
     const uint8_t* data_ = nullptr;
     size_t         size_ = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    HANDLE          file_ = INVALID_HANDLE_VALUE;
+    HANDLE          mapping_ = nullptr;
+#else
     int            fd_   = -1;
+#endif
 };
 
 // ============================================================================
@@ -408,6 +503,33 @@ struct GenConfig {
     float top_p      = 0.9f;
 };
 
+struct KVCache {
+    int n_layers = 0;
+    int max_seq_len = 0;
+    int kv_width = 0;
+    std::vector<float> keys;
+    std::vector<float> values;
+
+    void initialize(const ModelConfig& config) {
+        n_layers = config.n_layers;
+        max_seq_len = config.max_seq_len;
+        kv_width = config.n_kv_heads * config.d_head();
+        size_t layer_size = static_cast<size_t>(max_seq_len) * kv_width;
+        keys.assign(static_cast<size_t>(n_layers) * layer_size, 0.0f);
+        values.assign(static_cast<size_t>(n_layers) * layer_size, 0.0f);
+    }
+
+    float* key(int layer, int pos) {
+        size_t index = (static_cast<size_t>(layer) * max_seq_len + pos) * kv_width;
+        return keys.data() + index;
+    }
+
+    float* value(int layer, int pos) {
+        size_t index = (static_cast<size_t>(layer) * max_seq_len + pos) * kv_width;
+        return values.data() + index;
+    }
+};
+
 // ============================================================================
 // Tensor Metadata
 // ============================================================================
@@ -439,7 +561,7 @@ struct TensorInfo {
 
 class Tokenizer {
 public:
-    void load(const JsonValue& vocab_obj) {
+    void load(const JsonValue& vocab_obj, const JsonValue& metadata = JsonValue()) {
         tok2id_.clear();
         id2tok_.clear();
         if (!vocab_obj.is_object()) {
@@ -453,8 +575,25 @@ public:
                 id2tok_.resize(static_cast<size_t>(id) + 1);
             id2tok_[static_cast<size_t>(id)] = k;
         }
-        bos_id_ = lookup("<bos>");
-        eos_id_ = lookup("<eos>");
+
+        unk_id_ = metadata["unk_id"].integer(lookup(metadata["unk_token"].as_string()));
+        if (!valid_id(unk_id_)) unk_id_ = lookup("<unk>");
+        if (!valid_id(unk_id_)) unk_id_ = lookup("<|unk|>");
+        if (!valid_id(unk_id_)) unk_id_ = id2tok_.empty() ? 0 : 0;
+
+        bos_id_ = metadata["bos_id"].integer(-1);
+        if (!valid_id(bos_id_)) bos_id_ = lookup(metadata["bos_token"].as_string());
+        if (!valid_id(bos_id_)) bos_id_ = lookup("<bos>");
+        if (!valid_id(bos_id_)) bos_id_ = lookup("<s>");
+        if (!valid_id(bos_id_)) bos_id_ = lookup("<|endoftext|>");
+        if (!valid_id(bos_id_)) bos_id_ = unk_id_;
+
+        eos_id_ = metadata["eos_id"].integer(-1);
+        if (!valid_id(eos_id_)) eos_id_ = lookup(metadata["eos_token"].as_string());
+        if (!valid_id(eos_id_)) eos_id_ = lookup("<eos>");
+        if (!valid_id(eos_id_)) eos_id_ = lookup("</s>");
+        if (!valid_id(eos_id_)) eos_id_ = lookup("<|endoftext|>");
+        if (!valid_id(eos_id_)) eos_id_ = -1;
     }
 
     int lookup(const std::string& tok) const {
@@ -464,8 +603,30 @@ public:
 
     int encode(const std::string& tok) const {
         int id = lookup(tok);
-        if (id < 0) SLM_DIE_FMT("Tokenizer: unknown token '%s'", tok.c_str());
-        return id;
+        return valid_id(id) ? id : unk_id_;
+    }
+
+    int encode_word(const std::string& word, bool leading_space,
+                    bool leading_newline = false) const {
+        if (word.empty()) return unk_id_;
+
+        int id = lookup(word);
+        if (valid_id(id)) return id;
+
+        if (leading_newline) {
+            id = lookup(std::string("Ċ") + word);
+            if (valid_id(id)) return id;
+        }
+        if (leading_space) {
+            id = lookup(std::string("Ġ") + word);
+            if (valid_id(id)) return id;
+        }
+
+        // Accept already byte-level encoded input while also handling a raw
+        // prompt that contains these marker characters.
+        std::string sanitized = strip_byte_marker(word);
+        id = lookup(sanitized);
+        return valid_id(id) ? id : unk_id_;
     }
 
     std::string decode(int id) const {
@@ -475,12 +636,23 @@ public:
 
     int bos() const { return bos_id_; }
     int eos() const { return eos_id_; }
+    int unk() const { return unk_id_; }
+    bool valid_id(int id) const {
+        return id >= 0 && id < static_cast<int>(id2tok_.size());
+    }
 
 private:
+    static std::string strip_byte_marker(const std::string& token) {
+        if (token.compare(0, 2, "Ġ") == 0 || token.compare(0, 2, "Ċ") == 0)
+            return token.substr(2);
+        return token;
+    }
+
     std::unordered_map<std::string, int> tok2id_;
     std::vector<std::string>             id2tok_;
+    int unk_id_ = 0;
     int bos_id_ = 0;
-    int eos_id_ = 1;
+    int eos_id_ = -1;
 };
 
 // ============================================================================
@@ -495,17 +667,37 @@ public:
         if (!file_.open(path)) return false;
 
         // ---- Parse JSON header ----
-        // The file layout:  [JSON header][0x00 separator][tensor data]
-        // Find the null-terminated JSON region.
-        size_t json_len = 0;
-        while (json_len < file_.size() && file_.data()[json_len] != 0)
-            ++json_len;
-        if (json_len == 0 || json_len >= file_.size()) {
-            SLM_DIE_FMT("Model: cannot find JSON header in '%s'", path);
+        // New layout: [uint32 LE header length][padded JSON][tensor data].
+        // Keep reading the older [JSON][NUL][tensor data] layout as well.
+        JsonParser parser;
+        JsonValue root;
+        bool length_prefixed = false;
+        uint32_t header_length = 0;
+        if (file_.size() >= sizeof(header_length)) {
+            std::memcpy(&header_length, file_.data(), sizeof(header_length));
+            length_prefixed = header_length > 0 &&
+                              header_length % alignof(float) == 0 &&
+                              static_cast<size_t>(header_length) + sizeof(header_length) < file_.size() &&
+                              file_.data()[sizeof(header_length)] == '{';
         }
 
-        JsonParser parser;
-        JsonValue root = parser.parse(file_.cstr());
+        size_t json_start = 0;
+        size_t json_len = 0;
+        std::string json_storage;
+        if (length_prefixed) {
+            json_start = sizeof(header_length);
+            json_len = header_length;
+            json_storage.assign(reinterpret_cast<const char*>(file_.data() + json_start),
+                                json_len);
+            json_storage.push_back('\0');
+            root = parser.parse(json_storage.c_str());
+        } else {
+            while (json_len < file_.size() && file_.data()[json_len] != 0)
+                ++json_len;
+            if (json_len == 0 || json_len >= file_.size())
+                SLM_DIE_FMT("Model: cannot find JSON header in '%s'", path);
+            root = parser.parse(file_.cstr());
+        }
 
         // ---- Config ----
         const JsonValue& cfg = root["config"];
@@ -529,14 +721,17 @@ public:
                  config_.max_seq_len, config_.norm_eps, config_.rope_theta);
 
         // ---- Vocabulary ----
-        tokenizer_.load(root["vocab"]);
+        tokenizer_.load(root["vocab"], root);
 
         // ---- Tensor metadata ----
         const JsonValue& tensors_json = root["tensors"];
         if (!tensors_json.is_array()) SLM_DIE("Model: missing 'tensors' array");
 
         tensor_data_offset_ = static_cast<size_t>(root["tensor_data_offset"].integer());
-        if (tensor_data_offset_ == 0) SLM_DIE("Model: missing 'tensor_data_offset'");
+        if (tensor_data_offset_ == 0 || tensor_data_offset_ >= file_.size())
+            SLM_DIE("Model: invalid 'tensor_data_offset'");
+        if (length_prefixed && tensor_data_offset_ != sizeof(header_length) + header_length)
+            SLM_DIE("Model: tensor_data_offset does not match header length");
 
         tensors_.clear();
         name2tensor_.clear();
@@ -548,12 +743,23 @@ public:
             ti.shape.reserve(shape_arr.size());
             for (auto& s : shape_arr) ti.shape.push_back(s.integer());
             ti.offset = static_cast<size_t>(tj["offset"].integer());
+            if (ti.dtype != "f32")
+                SLM_DIE_FMT("Model: tensor '%s' has dtype '%s' (only f32 supported)",
+                             ti.name.c_str(), ti.dtype.c_str());
+            if (ti.offset % alignof(float) != 0 || ti.byte_size() % alignof(float) != 0)
+                SLM_DIE_FMT("Model: tensor '%s' is not float-aligned", ti.name.c_str());
+            if (ti.offset > file_.size() - tensor_data_offset_ ||
+                ti.byte_size() > file_.size() - tensor_data_offset_ - ti.offset)
+                SLM_DIE_FMT("Model: tensor '%s' exceeds mapped file", ti.name.c_str());
             name2tensor_[ti.name] = tensors_.size();
             tensors_.push_back(std::move(ti));
         }
 
         // ---- Resolve weight pointers ----
-        const float* base = file_.as_float(tensor_data_offset_);
+        const uint8_t* base_bytes = file_.offset(tensor_data_offset_);
+        if (reinterpret_cast<uintptr_t>(base_bytes) % alignof(float) != 0)
+            SLM_DIE("Model: tensor data is not float-aligned");
+        const float* base = reinterpret_cast<const float*>(base_bytes);
 
         auto ptr = [&](const std::string& name) -> const float* {
             auto it = name2tensor_.find(name);
@@ -561,9 +767,6 @@ public:
                 SLM_DIE_FMT("Model: missing tensor '%s'", name.c_str());
             }
             const TensorInfo& ti = tensors_[it->second];
-            if (ti.dtype != "f32")
-                SLM_DIE_FMT("Model: tensor '%s' has dtype '%s' (only f32 supported)",
-                             name.c_str(), ti.dtype.c_str());
             return base + ti.offset / sizeof(float);
         };
 
@@ -605,6 +808,11 @@ public:
     // ---- Forward pass (returns logits for the last token position) ----
     std::vector<float> forward(const std::vector<int>& tokens) const;
 
+    // Incremental forward pass for one token. The cache contains K/V entries
+    // for positions [0, pos], so the caller can generate without recomputing
+    // the entire prefix on every step.
+    std::vector<float> forward_cached(int token, int pos, KVCache& cache) const;
+
 private:
     MappedFile  file_;
     ModelConfig config_;
@@ -635,9 +843,11 @@ private:
 // out[d_out] = W[d_out, d_in] @ x[d_in] + b[d_out]  (row-major W, bias optional)
 inline void linear(const float* x, const float* W, const float* b,
                    float* out, int d_in, int d_out) {
+    SLM_OMP_PARALLEL_FOR
     for (int i = 0; i < d_out; i++) {
         float sum = (b != nullptr) ? b[i] : 0.0f;
         const float* row = W + static_cast<size_t>(i) * d_in;
+        SLM_OMP_SIMD_REDUCE(sum)
         for (int j = 0; j < d_in; j++) {
             sum += row[j] * x[j];
         }
@@ -653,8 +863,10 @@ inline void linear(const float* x, const float* W,
 // RMSNorm: out[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]
 inline void rms_norm(const float* x, const float* w, float* out, int n, float eps) {
     float ss = 0.0f;
+    SLM_OMP_SIMD_REDUCE(ss)
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     float scale = 1.0f / std::sqrt(ss / n + eps);
+    SLM_OMP_SIMD
     for (int i = 0; i < n; i++) out[i] = x[i] * scale * w[i];
 }
 
@@ -671,6 +883,7 @@ inline void softmax(float* x, int n) {
 
 // SwiGLU: out[i] = silu(gate[i]) * up[i]
 inline void swiglu(const float* gate, const float* up, float* out, int n) {
+    SLM_OMP_PARALLEL_FOR
     for (int i = 0; i < n; i++) {
         float g = gate[i];
         float s = g / (1.0f + std::exp(-g));   // SiLU(x) = x * sigmoid(x)
@@ -708,6 +921,14 @@ inline void rope_apply(float* q, float* k, int n_heads, int n_kv_heads,
 // ============================================================================
 
 inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
+    if (tokens.empty()) SLM_DIE("Model::forward: token sequence is empty");
+    if (tokens.size() > static_cast<size_t>(config_.max_seq_len))
+        SLM_DIE("Model::forward: token sequence exceeds max_seq_len");
+    for (int token : tokens) {
+        if (token < 0 || token >= config_.vocab_size)
+            SLM_DIE_FMT("Model::forward: token %d out of range", token);
+    }
+
     const int T     = static_cast<int>(tokens.size());
     const int D     = config_.d_model;
     const int H     = config_.n_heads;
@@ -731,6 +952,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
     std::vector<float> ff_down(static_cast<size_t>(T) * FF);
 
     // 1. Token embeddings:  x[t,:] = tok_emb[tokens[t]]
+    SLM_OMP_PARALLEL_FOR
     for (int t = 0; t < T; t++) {
         std::memcpy(&x[static_cast<size_t>(t) * D],
                      tok_emb_ + tokens[static_cast<size_t>(t)] * D,
@@ -742,6 +964,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
 
     for (int l = 0; l < config_.n_layers; l++) {
         // --- Attention layer norm ---
+        SLM_OMP_PARALLEL_FOR
         for (int t = 0; t < T; t++) {
             rms_norm(&x[static_cast<size_t>(t) * D],
                      layer_attn_norm_[l],
@@ -749,6 +972,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- Q, K, V projections ---
+        SLM_OMP_PARALLEL_FOR
         for (int t = 0; t < T; t++) {
             const float* ht = &h[static_cast<size_t>(t) * D];
             linear(ht, layer_wq_[l], &q[static_cast<size_t>(t) * H * DH], D, H * DH);
@@ -757,6 +981,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- RoPE ---
+        SLM_OMP_PARALLEL_FOR
         for (int t = 0; t < T; t++) {
             rope_apply(&q[static_cast<size_t>(t) * H * DH],
                        &k[static_cast<size_t>(t) * KH * DH],
@@ -765,6 +990,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
 
         // --- Scaled dot-product attention with causal mask ---
         const float scale = 1.0f / std::sqrt(static_cast<float>(DH));
+        SLM_OMP_PARALLEL_FOR_COLLAPSE_2
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < H; h++) {
                 int kv_h = h / kv_rep;
@@ -777,6 +1003,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
                         float dot = 0.0f;
                         const float* qh = &q[static_cast<size_t>(t) * H * DH + h * DH];
                         const float* kh = &k[static_cast<size_t>(t2) * KH * DH + kv_h * DH];
+                        SLM_OMP_SIMD_REDUCE(dot)
                         for (int i = 0; i < DH; i++) dot += qh[i] * kh[i];
                         scores[static_cast<size_t>(t2)] = dot * scale;
                     }
@@ -787,6 +1014,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
                 float* out_h = &attn_out[static_cast<size_t>(t) * D + h * DH];
                 for (int i = 0; i < DH; i++) {
                     float s = 0.0f;
+                    SLM_OMP_SIMD_REDUCE(s)
                     for (int t2 = 0; t2 <= t; t2++) {
                         s += scores[static_cast<size_t>(t2)] *
                              v[static_cast<size_t>(t2) * KH * DH + kv_h * DH + i];
@@ -797,6 +1025,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- Output projection ---
+        SLM_OMP_PARALLEL_FOR
         for (int t = 0; t < T; t++) {
             linear(&attn_out[static_cast<size_t>(t) * D],
                    layer_wo_[l],
@@ -804,7 +1033,9 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- Residual ---
-        for (size_t i = 0, n = static_cast<size_t>(T) * D; i < n; i++)
+        const size_t residual_size = static_cast<size_t>(T) * D;
+        SLM_OMP_PARALLEL_FOR
+        for (size_t i = 0; i < residual_size; i++)
             x[i] += proj[i];
 
         // --- FFN layer norm ---
@@ -815,6 +1046,7 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- FFN: gate_proj(W1) -> SiLU, up_proj(W3), SwiGLU, down_proj(W2) ---
+        SLM_OMP_PARALLEL_FOR
         for (int t = 0; t < T; t++) {
             size_t bt = static_cast<size_t>(t);
             const float* ht = &h[bt * D];
@@ -825,7 +1057,9 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- Residual ---
-        for (size_t i = 0, n = static_cast<size_t>(T) * D; i < n; i++)
+        const size_t residual_size = static_cast<size_t>(T) * D;
+        SLM_OMP_PARALLEL_FOR
+        for (size_t i = 0; i < residual_size; i++)
             x[i] += proj[i];
     }
 
@@ -839,10 +1073,110 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
     for (int vi = 0; vi < V; vi++) {
         float dot = 0.0f;
         const float* row = tok_emb_ + vi * D;
+        SLM_OMP_SIMD_REDUCE(dot)
         for (int j = 0; j < D; j++) dot += last_hidden[j] * row[j];
         logits[static_cast<size_t>(vi)] = dot;
     }
 
+    return logits;
+}
+
+inline std::vector<float> Model::forward_cached(int token, int pos, KVCache& cache) const {
+    const int D = config_.d_model;
+    const int H = config_.n_heads;
+    const int KH = config_.n_kv_heads;
+    const int DH = config_.d_head();
+    const int FF = config_.d_ff;
+    const int V = config_.vocab_size;
+
+    if (token < 0 || token >= V)
+        SLM_DIE_FMT("Model::forward_cached: token %d out of range", token);
+    if (pos < 0 || pos >= config_.max_seq_len)
+        SLM_DIE_FMT("Model::forward_cached: position %d exceeds max_seq_len %d",
+                     pos, config_.max_seq_len);
+    if (cache.n_layers != config_.n_layers ||
+        cache.max_seq_len != config_.max_seq_len ||
+        cache.kv_width != KH * DH)
+        SLM_DIE("Model::forward_cached: incompatible KV cache");
+
+    std::vector<float> x(D);
+    std::memcpy(x.data(), tok_emb_ + static_cast<size_t>(token) * D,
+                static_cast<size_t>(D) * sizeof(float));
+    std::vector<float> h(D);
+    std::vector<float> q(static_cast<size_t>(H) * DH);
+    std::vector<float> k(static_cast<size_t>(KH) * DH);
+    std::vector<float> v(static_cast<size_t>(KH) * DH);
+    std::vector<float> attn_out(D);
+    std::vector<float> proj(D);
+    std::vector<float> ff_gate(FF);
+    std::vector<float> ff_up(FF);
+    std::vector<float> ff_down(FF);
+
+    const int kv_rep = H / KH;
+    const float eps = config_.norm_eps;
+    const float theta = config_.rope_theta;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(DH));
+
+    for (int layer = 0; layer < config_.n_layers; layer++) {
+        rms_norm(x.data(), layer_attn_norm_[layer], h.data(), D, eps);
+        linear(h.data(), layer_wq_[layer], q.data(), D, H * DH);
+        linear(h.data(), layer_wk_[layer], k.data(), D, KH * DH);
+        linear(h.data(), layer_wv_[layer], v.data(), D, KH * DH);
+        rope_apply(q.data(), k.data(), H, KH, DH, pos, theta);
+
+        std::memcpy(cache.key(layer, pos), k.data(),
+                    static_cast<size_t>(KH * DH) * sizeof(float));
+        std::memcpy(cache.value(layer, pos), v.data(),
+                    static_cast<size_t>(KH * DH) * sizeof(float));
+
+        std::fill(attn_out.begin(), attn_out.end(), 0.0f);
+        SLM_OMP_PARALLEL_FOR
+        for (int head = 0; head < H; head++) {
+            const int kv_head = head / kv_rep;
+            const float* q_head = q.data() + head * DH;
+            std::vector<float> scores(static_cast<size_t>(pos) + 1);
+            for (int past = 0; past <= pos; past++) {
+                const float* k_head = cache.key(layer, past) + kv_head * DH;
+                float dot = 0.0f;
+                SLM_OMP_SIMD_REDUCE(dot)
+                for (int i = 0; i < DH; i++) dot += q_head[i] * k_head[i];
+                scores[static_cast<size_t>(past)] = dot * scale;
+            }
+            softmax(scores.data(), pos + 1);
+
+            float* out_head = attn_out.data() + head * DH;
+            for (int i = 0; i < DH; i++) {
+                float sum = 0.0f;
+                SLM_OMP_SIMD_REDUCE(sum)
+                for (int past = 0; past <= pos; past++) {
+                    sum += scores[static_cast<size_t>(past)] *
+                           (cache.value(layer, past) + kv_head * DH)[i];
+                }
+                out_head[i] = sum;
+            }
+        }
+
+        linear(attn_out.data(), layer_wo_[layer], proj.data(), D, D);
+        for (int i = 0; i < D; i++) x[static_cast<size_t>(i)] += proj[static_cast<size_t>(i)];
+
+        rms_norm(x.data(), layer_ffn_norm_[layer], h.data(), D, eps);
+        linear(h.data(), layer_w1_[layer], ff_gate.data(), D, FF);
+        linear(h.data(), layer_w3_[layer], ff_up.data(), D, FF);
+        swiglu(ff_gate.data(), ff_up.data(), ff_down.data(), FF);
+        linear(ff_down.data(), layer_w2_[layer], proj.data(), FF, D);
+        for (int i = 0; i < D; i++) x[static_cast<size_t>(i)] += proj[static_cast<size_t>(i)];
+    }
+
+    std::vector<float> last_hidden(D);
+    rms_norm(x.data(), final_norm_, last_hidden.data(), D, config_.norm_eps);
+    std::vector<float> logits(V);
+    for (int vocab = 0; vocab < V; vocab++) {
+        const float* row = tok_emb_ + static_cast<size_t>(vocab) * D;
+        float dot = 0.0f;
+        SLM_OMP_SIMD_REDUCE(dot)
+        for (int i = 0; i < D; i++) dot += last_hidden[static_cast<size_t>(i)] * row[i];
+        logits[static_cast<size_t>(vocab)] = dot;
+    }
     return logits;
 }
 
@@ -860,6 +1194,13 @@ inline int argmax(const float* logits, int n) {
 // Temperature + top-p sampling
 inline int sample_top_p(const float* logits, int n, float temp, float top_p,
                         std::mt19937& rng) {
+    if (n <= 0) SLM_DIE("Sampling requires at least one logit");
+    bool has_nonzero = false;
+    for (int i = 0; i < n; i++) {
+        if (!std::isfinite(logits[i])) SLM_DIE("Sampling received non-finite logits");
+        if (logits[i] != 0.0f) has_nonzero = true;
+    }
+    if (!has_nonzero) log_info("Warning: all logits are zero; sampling uniformly");
     if (temp <= 0.0001f) return argmax(logits, n);
 
     // Apply temperature
@@ -915,27 +1256,68 @@ public:
     // callback(token_id, decoded_text) is called for each generated token.
     void generate(const std::string& prompt,
                   std::function<void(int, const std::string&)> callback) {
-        // Encode prompt — split on spaces for simplicity
-        std::vector<int> tokens;
         const auto& tok = model_.tokenizer();
-        tokens.push_back(tok.bos());
+        KVCache cache;
+        cache.initialize(model_.config());
 
-        // Simple space-tokenisation of prompt
-        std::istringstream iss(prompt);
+        std::vector<int> prompt_tokens;
+        int bos_id = tok.bos();
+        if (!tok.valid_id(bos_id) || bos_id >= model_.config().vocab_size)
+            bos_id = tok.unk();
+        if (!tok.valid_id(bos_id) || bos_id >= model_.config().vocab_size)
+            SLM_DIE("Generator: tokenizer has no valid BOS/UNK token");
+        prompt_tokens.push_back(bos_id);
+
         std::string word;
-        while (iss >> word) {
-            int id = tok.lookup(word);
-            if (id >= 0) tokens.push_back(id);
-        }
+        bool leading_space = false;
+        bool leading_newline = false;
+        auto append_word = [&]() {
+            if (word.empty()) return;
+            int id = tok.encode_word(word, leading_space, leading_newline);
+            if (id < 0 || id >= model_.config().vocab_size)
+                id = tok.unk();
+            if (id < 0 || id >= model_.config().vocab_size)
+                SLM_DIE_FMT("Generator: invalid token id %d for prompt word '%s'",
+                             id, word.c_str());
+            prompt_tokens.push_back(id);
+            word.clear();
+            leading_space = false;
+            leading_newline = false;
+        };
 
-        for (int step = 0; step < gc_.max_tokens; step++) {
-            std::vector<float> logits = model_.forward(tokens);
+        for (char c : prompt) {
+            if (c == '\n' || c == '\r') {
+                append_word();
+                leading_newline = true;
+                leading_space = false;
+            } else if (c == ' ' || c == '\t') {
+                append_word();
+                if (!leading_newline) leading_space = true;
+            } else {
+                word.push_back(c);
+            }
+        }
+        append_word();
+
+        if (prompt_tokens.size() > static_cast<size_t>(model_.config().max_seq_len))
+            SLM_DIE("Generator: prompt exceeds model max_seq_len");
+
+        int pos = 0;
+        std::vector<float> logits;
+        for (int token : prompt_tokens)
+            logits = model_.forward_cached(token, pos++, cache);
+
+        for (int step = 0; step < gc_.max_tokens && pos < model_.config().max_seq_len; step++) {
             int next = sample_top_p(logits.data(), static_cast<int>(logits.size()),
                                     gc_.temp, gc_.top_p, rng_);
             if (next == tok.eos()) break;
-            tokens.push_back(next);
             std::string piece = tok.decode(next);
             callback(next, piece);
+
+            // Feed the sampled token back through the one-token cached path.
+            if (step + 1 >= gc_.max_tokens || pos >= model_.config().max_seq_len)
+                break;
+            logits = model_.forward_cached(next, pos++, cache);
         }
     }
 
@@ -946,3 +1328,9 @@ private:
 };
 
 } // namespace slm
+
+#undef SLM_OMP_PARALLEL_FOR
+#undef SLM_OMP_PARALLEL_FOR_COLLAPSE_2
+#undef SLM_OMP_SIMD
+#undef SLM_OMP_SIMD_REDUCE
+#undef SLM_OMP_PRAGMA
