@@ -1057,7 +1057,6 @@ inline std::vector<float> Model::forward(const std::vector<int>& tokens) const {
         }
 
         // --- Residual ---
-        const size_t residual_size = static_cast<size_t>(T) * D;
         SLM_OMP_PARALLEL_FOR
         for (size_t i = 0; i < residual_size; i++)
             x[i] += proj[i];
