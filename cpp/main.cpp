@@ -340,16 +340,7 @@ static void cmd_chat(const Args& args) {
             continue;
         }
 
-        std::string turn_prompt;
-        if (has_chatml) {
-            turn_prompt = "<|im_start|>user\n" + user_input + "<|im_end|>\n<|im_start|>assistant\n";
-        } else {
-            if (first_turn) {
-                turn_prompt = "User: " + user_input + "\nAssistant: ";
-            } else {
-                turn_prompt = "\nUser: " + user_input + "\nAssistant: ";
-            }
-        }
+        std::string turn_prompt = "<|im_start|>user\n" + user_input + "<|im_end|>\n<|im_start|>assistant\n";
 
         std::vector<int> turn_tokens = encode_text(tok, config.vocab_size, turn_prompt, first_turn);
 
@@ -385,12 +376,13 @@ static void cmd_chat(const Args& args) {
             int next_token = slm::sample_top_p(logits.data(), static_cast<int>(logits.size()),
                                                gc.temp, gc.top_p, rng);
 
-            if (next_token == eos_id || next_token == 0 || (has_chatml && next_token == im_end_id)) {
+            if (next_token == eos_id || next_token == 0 || next_token == 2 ||
+                (im_end_id >= 0 && next_token == im_end_id)) {
                 break;
             }
 
             std::string piece = tok.decode(next_token);
-            if (piece == "<|endoftext|>" || piece == "</s>" || piece == "<eos>") {
+            if (piece == "<|im_end|>" || piece == "<|endoftext|>" || piece == "</s>" || piece == "<eos>") {
                 break;
             }
 
