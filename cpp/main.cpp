@@ -259,9 +259,13 @@ static void cmd_run(const Args& args) {
 
     slm::Generator gen(model, gc, /*seed=*/1337);
 
-    std::string prompt = args.prompt.empty() ? "Hello" : args.prompt;
+    std::string raw_prompt = args.prompt.empty() ? "Hello" : args.prompt;
+    std::string prompt = raw_prompt;
+    if (prompt.find("<|im_start|>") == std::string::npos) {
+        prompt = "<|im_start|>user\n" + raw_prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    }
     setvbuf(stdout, nullptr, _IONBF, 0);
-    fprintf(stderr, "\n[Prompt] %s\n[Output] ", prompt.c_str());
+    fprintf(stderr, "\n[Prompt] %s\n[Output] ", raw_prompt.c_str());
     fflush(stderr);
 
     auto t0 = std::chrono::high_resolution_clock::now();
